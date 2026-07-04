@@ -227,12 +227,25 @@ async function getBinInfo(bin) {
 async function checkCard(ccInput, storeUrl, onStep) {
   const startTime = Date.now();
 
+  // Default binInfo — always available
+  let binInfo = { brand: "VISA", issuer: "BANK", country: "USA", flag: "" };
+
   const card = parseCC(ccInput);
   if (!card) {
-    return { success: false, response: "INVALID_FORMAT", category: "declined" };
+    return {
+      success: false,
+      response: "INVALID_FORMAT",
+      category: "declined",
+      binInfo,
+      timeTaken: "0.00",
+      product: null
+    };
   }
 
   const bin = card.number.substring(0, 6);
+
+  // BIN fetch early — parallel me karo
+  const binPromise = getBinInfo(bin).then(b => { binInfo = b; }).catch(() => {});
 
   // Step 1
   await onStep(
@@ -247,7 +260,15 @@ async function checkCard(ccInput, storeUrl, onStep) {
   // Get product
   const product = await getProduct(storeUrl);
   if (!product) {
-    return { success: false, response: "STORE_ERROR", category: "declined" };
+    await binPromise;
+    return {
+      success: false,
+      response: "STORE_ERROR — Could not fetch products",
+      category: "declined",
+      binInfo,
+      timeTaken: ((Date.now() - startTime) / 1000).toFixed(2),
+      product: null
+    };
   }
 
   // Step 2
@@ -257,15 +278,23 @@ async function checkCard(ccInput, storeUrl, onStep) {
     "<tg-emoji emoji-id=\"5195072744798051557\">💳</tg-emoji> <b>Card:</b> <code>" + ccInput + "</code>\n" +
     "━━━━━━━━━━━━━━━\n" +
     "✅ <b>[1/5]</b> Store connected!\n" +
-    "<tg-emoji emoji-id=\"5213452215527677338\">⏳</tg-emoji> <b>[2/5]</b> Product found: $" + product.price + "\n" +
-    "⬜⬜⬜⬜⬜\n" +
+    "<tg-emoji emoji-id=\"5213452215527677338\">⏳</tg-emoji> <b>[2/5]</b> Product: $" + product.price + "\n" +
+    "🟩⬜⬜⬜⬜\n" +
     "🛒 <b>Item:</b> " + escapeHTML(product.title)
   );
 
   // Create checkout
   const checkout = await createCheckout(storeUrl, product.variantId);
   if (!checkout) {
-    return { success: false, response: "CHECKOUT_ERROR", category: "declined" };
+    await binPromise;
+    return {
+      success: false,
+      response: "CHECKOUT_ERROR — Could not create checkout",
+      category: "declined",
+      binInfo,
+      timeTaken: ((Date.now() - startTime) / 1000).toFixed(2),
+      product
+    };
   }
 
   // Step 3
@@ -277,8 +306,8 @@ async function checkCard(ccInput, storeUrl, onStep) {
     "✅ <b>[1/5]</b> Store connected!\n" +
     "✅ <b>[2/5]</b> Product: $" + product.price + "\n" +
     "<tg-emoji emoji-id=\"5213452215527677338\">⏳</tg-emoji> <b>[3/5]</b> Checkout created...\n" +
-    "🟩⬜⬜⬜⬜\n" +
-    "🛒 Token: <code>" + checkout.token.substring(0, 10) + "...</code>"
+    "🟩🟩⬜⬜⬜\n" +
+    "🔑 Token: <code>" + checkout.token.substring(0, 10) + "...</code>"
   );
 
   // Submit payment
@@ -293,21 +322,21 @@ async function checkCard(ccInput, storeUrl, onStep) {
     "✅ <b>[1/5]</b> Store connected!\n" +
     "✅ <b>[2/5]</b> Product: $" + product.price + "\n" +
     "✅ <b>[3/5]</b> Checkout ready!\n" +
-    "<tg-emoji emoji-id=\"5213452215527677338\">⏳</tg-emoji> <b>[4/5]</b> Submitting card to gateway...\n" +
-    "🟩🟩⬜⬜⬜"
+    "<tg-emoji emoji-id=\"5213452215527677338\">⏳</tg-emoji> <b>[4/5]</b> Submitting card...\n" +
+    "🟩🟩🟩⬜⬜"
   );
 
-  // Check status
+  // Get result
   let finalResponse = "DECLINED";
   let category = "declined";
 
   if (payment && !payment.error) {
     const status = await checkPaymentStatus(storeUrl, checkout.token);
-    const rawResp = payment.payment?.message ||
+    const rawResp =
+      payment.payment?.message ||
       payment.payment?.response ||
       payment.transaction?.message ||
       status || "DECLINED";
-
     finalResponse = String(rawResp).toUpperCase();
     category = classifyResponse(finalResponse, status === "APPROVED");
   } else if (payment && payment.error) {
@@ -329,12 +358,20 @@ async function checkCard(ccInput, storeUrl, onStep) {
     "🟩🟩🟩🟩⬜"
   );
 
-  await sleep(1500);
+  await new Promise(r => setTimeout(r, 1000));
 
-  // BIN info
-  const binInfo = await getBinInfo(bin);
-  const timeTaken = ((Date.now() - startTime) / 1000).toFixed(2);
+  // Wait for BIN
+  await binPromise;
 
+  return {
+    success: true,
+    response: finalResponse,
+    category,
+    product,
+    binInfo,
+    timeTaken: ((Date.now() - startTime) / 1000).toFixed(2)
+  };
+}
   return {
     success: true,
     response: finalResponse,
