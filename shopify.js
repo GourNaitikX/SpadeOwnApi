@@ -372,14 +372,3 @@ async function checkCard(ccInput, storeUrl, onStep) {
     timeTaken: ((Date.now() - startTime) / 1000).toFixed(2)
   };
 }
-  return {
-    success: true,
-    response: finalResponse,
-    category: category,
-    product: product,
-    binInfo: binInfo,
-    timeTaken: timeTaken
-  };
-}
-
-module.exports = { checkCard, classifyResponse };
