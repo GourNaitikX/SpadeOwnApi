@@ -149,7 +149,7 @@ bot.onText(/^\/sh(?: (.+))?/, async (msg, match) => {
       } catch(e) {}
     };
 
-    const result = await checkCard(ccInput, shopifyStore, onStep);
+    const result = await checkCard(ccInput, shopifyStore, onStep, bot, chatId);
 
     // Final result
     const finalMsg = formatResult(ccInput, result);
