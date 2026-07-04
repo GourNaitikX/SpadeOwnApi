@@ -31,7 +31,7 @@ function escapeHTML(str) {
 const activeChecks = new Set();
 
 // Default store
-let shopifyStore = "https://bobbyjackbrand.com";
+let shopifyStore = "https://greatergoods.com";
 
 // =================== KEYBOARDS ===================
 function getResultKeyboard(category) {
