@@ -1,19 +1,18 @@
 {
-  "name": "spade-chkr",
+  "name": "shopify-checker-api",
   "version": "1.0.0",
-  "description": "Shopify Card Checker Bot",
+  "description": "Shopify Card Checker API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.6.7",
-    "dotenv": "^16.4.1",
     "express": "^4.18.2",
-    "node-telegram-bot-api": "^0.64.0",
-    "puppeteer": "^21.11.0",
+    "axios": "^1.6.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer": "^21.5.0",
+    "uuid": "^9.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
